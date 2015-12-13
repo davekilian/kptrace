@@ -1,0 +1,255 @@
+#!/usr/bin/env python
+#
+# kptrace: Quick 'n' dirty tool to extract a backtrace from a panic report
+#
+
+import argparse
+import glob
+import os
+import re
+import subprocess
+import sys
+
+class PanicReport:
+    """ Parsed representation of a .panic file """
+
+    def __init__(self):
+        self.kernel_version = "" # Kernel version string, e.g. 15C50
+        self.kernel_slide = ""   # Kernel slide field
+        self.exts_in_trace = []  # List of extensions in the backtrace.
+                                 # Each item is a tuple (kext name, text address)
+        self.addresses = []      # List of return address in the backtrace
+
+    @staticmethod
+    def latest():
+        paths = sorted(glob.glob("/Library/Logs/DiagnosticReports/Kernel*.panic"))
+        if len(paths) == 0:
+            raise Exception("No panic reports in /Library/Logs/DiagnosticReports")
+        else:
+            return paths.pop()
+
+    @staticmethod
+    def parse(path):
+        result = PanicReport()
+
+        # Read the file
+        with open(path) as f:
+            lines = f.readlines()
+
+        # Parse the kernel version number
+        version_label = "Mac OS version:\n"
+        if not version_label in lines:
+            raise Exception("Didn't find kernel version number in panic report")
+        else:
+            result.kernel_version = lines[lines.index(version_label) + 1].strip()
+
+        # Parse the kernel slide
+        slide_label = "Kernel slide:"
+        for line in lines:
+            if line.startswith(slide_label):
+                result.kernel_slide = line[len(slide_label):].strip()
+                break
+
+        if result.kernel_slide == None:
+            raise Exception("Didn't find kernel slide in panic report")
+
+        # Parse the modules in the backtrace
+        exts_label = "Kernel Extensions in backtrace:"
+        found_exts_label = False
+        for line in lines:
+            if found_exts_label:
+                if len(line.strip()) > 0:
+                    ext = line.strip()
+                    if ext.startswith("dependency:"):
+                        ext = ext[len("dependency:"):].strip()
+
+                    fullname = ext[:ext.find("(")].strip()
+                    name = fullname[fullname.rfind(".") + 1:].strip()
+
+                    addr = ext[ext.find("@") + 1:].strip()
+                    addr = addr[:18]
+
+                    result.exts_in_trace.append((name, addr))
+                else:
+                    break
+            elif exts_label in line:
+                found_exts_label = True
+
+        if not found_exts_label:
+            raise Exception("Didn't find a list of extensions in the backtrace")
+
+        # Read the backtrace addresses
+        backtrace_label = "Backtrace"
+        found_backtrace_label = False
+        for line in lines:
+            if found_backtrace_label:
+                if re.match(".*0x.{16} : 0x.{16}.*", line):
+                    addr = line[20:].strip()
+                    result.addresses.append(addr)
+                else:
+                    break;
+            elif line.startswith(backtrace_label):
+                found_backtrace_label = True
+
+        if not found_backtrace_label:
+            raise Exception("Didn't find a backtrace in the panic report")
+
+        return result
+
+class CommandList:
+    """ In-memory representation for a command list """
+
+    def __init__(self):
+        self.contents = ""
+
+    def add(self, command):
+        self.contents += command + "\n"
+
+    def file_contents(self):
+        return self.contents
+
+def kptrace(reportfile, kdk, kexts):
+    """
+    Produces and executes an lldb command script to dump a kernel panic backtrace.
+
+    @reportfile: The full path to the kernel panic report to parse.
+                 If this is None, kptrace() uses the newest report in /Library/Logs/DiagnosticReports.
+
+    @kdk:        The full path to the kernel development kit to load kernel symbols from.
+                 If this is None, kptrace() parses the OS X version from the report,
+                 and finds the matching KDK version in /Library/Developer/KDKs
+
+    @kexts:      A list of paths to third-party kexts to load third-party module symbols from.
+                 Each path should point to the root .kext directory for the kernel extension.
+                 This list is allowed to be empty.
+    """
+
+    # Load and parse the panic report
+    if reportfile == None:
+        reportfile = PanicReport.latest()
+
+    print("Report: " + reportfile)
+
+    report = PanicReport.parse(reportfile)
+
+    print("Kernel version: " + report.kernel_version)
+    print("Kernel slide: " + report.kernel_slide)
+    print("Extensions in backtrace: " + str(len(report.exts_in_trace)))
+    print("Backtrace: " + str(len(report.addresses)) + " frame(s)")
+
+    # Find the KDK
+    if kdk == None:
+        expr = "/Library/Developer/KDKs/*" + report.kernel_version + "*"
+        matches = glob.glob(expr)
+        if len(matches) == 0:
+            err  = "No KDK for OS X kernel " + report.kernel_version + "found in " + expr + ". "
+            err += "Please download the KDK from https://developer.apple.com/downloads"
+            raise Exception(err)
+        else:
+            kdk = matches[0]
+
+    print("KDK: " + kdk)
+
+    # Find the kext binaries
+    print
+    print("Resolving module paths ...")
+    print
+    searchdirs = glob.glob(kdk + "/System/Library/Extensions/*.kext") + kexts
+    pathtable = { }
+    for ext in report.exts_in_trace:
+        name = ext[0]
+        for searchdir in searchdirs:
+            path = searchdir + "/Contents/MacOS/" + name
+            if os.path.isfile(path):
+                print("  " + name + " -> " + path)
+                pathtable[name] = path
+                break
+        if name not in pathtable:
+            err  = "Unable to resolve file path for module " + name + ". "
+            err += "Are you missing a -kext reference?"
+            raise Exception(err)
+
+    # Generate the commands
+    print
+    print("Generating backtrace ...")
+    print
+
+    commands = CommandList()
+    commands.add("target create --no-dependents --arch x86_64 " + kdk + "/System/Library/Kernels/kernel")
+    commands.add("settings set target.load-script-from-symbol-file true")
+    commands.add("target modules load --file kernel --slide " + report.kernel_slide)
+
+    for ext in report.exts_in_trace:
+        (name, addr) = ext
+        commands.add("target modules add " + pathtable[name])
+        commands.add("target modules load --file " + name + " __TEXT " + addr)
+
+    for addr in report.addresses:
+        commands.add("image lookup -a " + addr)
+
+    # Save the commands to a temp file and feed them into lldb
+    command_file = "/tmp/kptracecmd"
+    with open(command_file, 'w+') as f:
+        f.write(commands.file_contents())
+
+    subprocess.call("cat " + command_file + " | lldb 2>&1 | grep Summary | sed \"s/^.*Summary: /  - /\"", shell=True)
+    print
+
+def usage():
+    print("kptrace: Parse a backtrace from an OS X kernel panic report")
+    print
+    print("To use kptrace, you must have the Apple Kernel Development Kit (KDK) installed")
+    print("for the OS X build which crashed. You can download and install the KDK from")
+    print("https://developer.apple.com/downloads.")
+    print
+    print("With the KDK installed, you can use this script to obtain a backtrace from a")
+    print("crash report as follows:")
+    print
+    print("    kptrace [-report <report path>] [-kdk <kdk root>] [-kext <.kext root>]")
+    print
+    print("-report contains the full path to the kernel panic report file to parse.")
+    print("If you omit this, kptrace uses the most recent kernel panic report from")
+    print("/Library/Logs/DiagnosticRerports.")
+    print
+    print("-kdk contains the full path to the kernel development kit containing kernel")
+    print("symbols. If omitted, kptrace parses the kernel version from the panic report")
+    print("and finds the matching KDK in /Library/Developer/KDKSs.")
+    print
+    print("-kext contains the full path to a .kext directory for a third-party kernel")
+    print("extension which participated in the backtrace. You need to add this if the")
+    print("crash contains your own third-party kext in the backtrace. You can specify")
+    print("this argument multiple times if you have multiple extensions.")
+    print
+
+if __name__ == "__main__":
+    report = None
+    kdk = None
+    kexts = []
+
+    i = 1
+    while i < len(sys.argv):
+        flag = sys.argv[i]
+        if flag == "-?" or flag == "--help":
+            usage()
+            quit()
+
+        if i + 1 >= len(sys.argv):
+            usage()
+            quit()
+
+        value = sys.argv[i + 1]
+        i += 2
+
+        if flag == "-report":
+            report = value
+        elif flag == "-kdk":
+            kdk = value
+        elif flag == "-kext":
+            kexts.append(value)
+        else:
+            print("Unknown argument: " + flag)
+            usage()
+            quit()
+
+    kptrace(report, kdk, kexts)
+
